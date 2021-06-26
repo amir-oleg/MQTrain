@@ -11,33 +11,43 @@ namespace ServerSide
     internal static class Program
     {
         private const string FileQueue = "Files";
-        private const string StatusQueue = "Status";
+        private const string ClientStatusExchange = "ClientStatus";
+        private const string ServerStatusExchange = "ServerStatus";
+        private static readonly byte[] StatusWaiting = Encoding.UTF8.GetBytes("Server waiting...");
+        private static readonly byte[] StatusWorking = Encoding.UTF8.GetBytes("Server working...");
         private static readonly Dictionary<string, List<byte[]>> Files = new Dictionary<string, List<byte[]>>();
 
-        private static void Main(string[] args)
+        private static void Main()
         {
-            var factory = new ConnectionFactory()
-            {
-                HostName = "localhost",
-                UserName = "guest",
-                Password = "guest",
-                Port = 5672,
-                RequestedConnectionTimeout = TimeSpan.FromMilliseconds(3000)
-            };
             try
             {
+                var factory = new ConnectionFactory
+                {
+                    HostName = "localhost",
+                    UserName = "guest",
+                    Password = "guest",
+                    Port = 5672,
+                    RequestedConnectionTimeout = TimeSpan.FromMilliseconds(3000)
+                };
                 using (var connection = factory.CreateConnection())
                 {
                     using (var channel = connection.CreateModel())
                     {
+                        channel.ExchangeDeclare(ClientStatusExchange, ExchangeType.Fanout);
+                        channel.ExchangeDeclare(ServerStatusExchange, ExchangeType.Fanout);
                         channel.QueueDeclare(FileQueue, false, false, false, null);
+                        var statusQueue = channel.QueueDeclare().QueueName;
+                        channel.QueueBind(statusQueue, ClientStatusExchange, string.Empty);
                         var consumer = new EventingBasicConsumer(channel);
+
                         consumer.Received += ConsumerOnReceived;
+
                         while (true)
                         {
-                            channel.BasicConsume(StatusQueue, true, consumer);
+                            channel.BasicConsume(statusQueue, true, consumer);
                             channel.BasicConsume(FileQueue, true, consumer);
-                            Thread.Sleep(500);
+                            channel.BasicPublish(ServerStatusExchange, string.Empty, null, StatusWaiting);
+                            //Thread.Sleep(500);
                         }
                     }
                 }
@@ -45,6 +55,7 @@ namespace ServerSide
             catch (Exception e)
             {
                 Console.WriteLine(e);
+                Console.Read();
             }
         }
 
@@ -54,21 +65,14 @@ namespace ServerSide
             {
                 return;
             }
-
-            switch (e.RoutingKey)
+            
+            if (e.RoutingKey == FileQueue)
             {
-                case FileQueue:
-                {
-                    FileOnReceived(consumer, e);
-                    break;
-                }
-                case StatusQueue:
-                {
-                    StatusOnReceived(e);
-                    break;
-                }
-                default:
-                    throw new ArgumentException($"Queue {e.RoutingKey} doesn't support");
+                FileOnReceived(consumer, e);
+            }
+            else if (e.Exchange == ClientStatusExchange)
+            {
+                StatusOnReceived(e);
             }
         }
 
@@ -78,6 +82,9 @@ namespace ServerSide
             {
                 return;
             }
+
+            consumer.Model.BasicPublish(ServerStatusExchange, string.Empty, null, StatusWorking);
+
             if (!Files.ContainsKey(e.BasicProperties.MessageId))
             {
                 Files.Add(e.BasicProperties.MessageId, new List<byte[]>());
@@ -93,10 +100,6 @@ namespace ServerSide
                 File.WriteAllBytes($@"H:/{e.BasicProperties.MessageId}", fileBody.ToArray());
                 Files[e.BasicProperties.MessageId].Clear();
                 Files.Remove(e.BasicProperties.MessageId);
-            }
-            else
-            {
-                //consumer.Model.BasicConsume(FileQueue, true, consumer);
             }
         }
 
